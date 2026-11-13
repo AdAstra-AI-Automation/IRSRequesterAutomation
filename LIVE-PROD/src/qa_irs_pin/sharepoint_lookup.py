@@ -22,10 +22,6 @@ _SHAREPOINT_SITE = "adastrainccom.sharepoint.com:/sites/AdAstraInternalAdminstra
 _WORKBOOK_NAME = "IRS Site Listing updated.xlsx"
 _SHEET_NAME = "Master Site and State"
 
-# TEIDs with known duplicate entries in the workbook — treat as ambiguous
-_AMBIGUOUS_TEIDS: set[str] = set()
-
-
 def _get_token(tenant: str, client_id: str, username: str, password: str) -> str | None:
     try:
         resp = requests.post(
@@ -50,21 +46,7 @@ def _download_workbook(token: str) -> bytes | None:
     session = requests.Session()
     session.headers["Authorization"] = f"Bearer {token}"
     try:
-        site_resp = session.get(f"https://graph.microsoft.com/v1.0/sites/{_SHAREPOINT_SITE}", timeout=30)
-        site_resp.raise_for_status()
-        site_id = site_resp.json()["id"]
-
-        search_resp = session.get(
-            f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive/root/search(q='{_WORKBOOK_NAME}')",
-            timeout=30,
-        )
-        search_resp.raise_for_status()
-        items = search_resp.json().get("value", [])
-        if not items:
-            logger.warning("SharePoint workbook '%s' not found.", _WORKBOOK_NAME)
-            return None
-
-        item = items[0]
+        item = find_workbook_item(session)
         drive_id = item["parentReference"]["driveId"]
         item_id = item["id"]
         content_resp = session.get(
@@ -76,6 +58,26 @@ def _download_workbook(token: str) -> bytes | None:
     except Exception as exc:
         logger.warning("SharePoint workbook download failed: %s", exc)
         return None
+    finally:
+        session.close()
+
+
+def find_workbook_item(session: requests.Session) -> dict[str, Any]:
+    """Find the exact master workbook; never choose an ambiguous search result."""
+    site_resp = session.get(f"https://graph.microsoft.com/v1.0/sites/{_SHAREPOINT_SITE}", timeout=30)
+    site_resp.raise_for_status()
+    site_id = site_resp.json()["id"]
+    url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drive/root/search(q='{_WORKBOOK_NAME}')"
+    matches = []
+    while url:
+        response = session.get(url, timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+        matches.extend(item for item in payload.get("value", []) if item.get("name") == _WORKBOOK_NAME and "file" in item)
+        url = payload.get("@odata.nextLink")
+    if len(matches) != 1:
+        raise ValueError(f"Expected one exact master workbook; found {len(matches)}.")
+    return matches[0]
 
 
 def _normalize_site_key(name: str) -> str:
@@ -122,6 +124,7 @@ def _load_lookup_tables(
             return {}, {}
 
         teid_map: dict[str, dict] = {}
+        ambiguous_teids: set[str] = set()
         site_name_map: dict[str, dict] = {}
         site_name_teid_count: dict[str, int] = {}
 
@@ -138,11 +141,19 @@ def _load_lookup_tables(
                 continue
 
             entry = {"site_name": site_name, "teid": teid_str, "state": state}
+            previous = teid_map.get(teid_str)
+            if previous and _normalize_site_key(previous["site_name"]) != _normalize_site_key(site_name):
+                ambiguous_teids.add(teid_str)
             teid_map[teid_str] = entry
 
             site_key = _normalize_site_key(site_name)
             site_name_teid_count[site_key] = site_name_teid_count.get(site_key, 0) + 1
             site_name_map[site_key] = entry
+
+        # A shared TEID cannot identify one canonical site/state. Appending another
+        # location must not silently redirect existing lookups to the newest row.
+        for teid in ambiguous_teids:
+            teid_map.pop(teid, None)
 
         # Mark ambiguous site name keys (multiple different TEIDs)
         ambiguous_keys = {k for k, count in site_name_teid_count.items() if count > 1}

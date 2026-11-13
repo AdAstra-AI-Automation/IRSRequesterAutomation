@@ -52,6 +52,7 @@ class RowProcessingOutcome:
     verification: dict[str, Any] | None = None
     manual_selection: dict[str, Any] | None = None
     modify_function: dict[str, Any] | None = None
+    sharepoint_sync: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

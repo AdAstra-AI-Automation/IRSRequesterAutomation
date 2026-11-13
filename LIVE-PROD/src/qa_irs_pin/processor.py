@@ -10,6 +10,7 @@ from typing import Any, Iterable
 
 from qa_irs_pin import registry
 from qa_irs_pin import sharepoint_lookup
+from qa_irs_pin import sharepoint_sync
 from qa_irs_pin.config import CUSTOMER_CREATE_OVERRIDES, DB_PATH, DEFAULT_NEW_SITE_PIN_SUFFIX, DEFAULT_NEW_SITE_PIN_TOTAL_LENGTH, OUTPUT_DIR, SITE_MATCH_THRESHOLD
 from qa_irs_pin.matching import best_site_match, normalize_site_name, requires_explicit_site_confirmation, tokenize, top_site_matches
 from qa_irs_pin.models import ParsedRow, ProcessingRunResult, RowProcessingOutcome
@@ -355,6 +356,29 @@ def process_rows(
         site_cache: dict[str, list[str]] = {}
         run_new_site_teids: dict[str, dict[str, str]] = {}
         run_next_new_teid: dict[str, int] = {}
+        run_site_sync_results: dict[tuple[str, str, str], dict[str, str]] = {}
+
+        def sync_created_site(
+            customer_name: str,
+            site_name: str,
+            teid: str,
+            candidate_sites: list[str],
+            teid_resolution: dict[str, object] | None,
+        ) -> dict[str, str] | None:
+            # Demo accounts must never add test locations to the IRS master sheet.
+            if not customer_name.upper().startswith("US GSA IRS "):
+                return None
+            known_site = any(normalize_site_name(site_name) == normalize_site_name(site) for site in candidate_sites)
+            if (teid_resolution or {}).get("siteExists") is not False and known_site:
+                return None
+            key = (customer_name, normalize_site_name(site_name), teid)
+            if key not in run_site_sync_results:
+                try:
+                    run_site_sync_results[key] = sharepoint_sync.append_new_site(site_name, teid)
+                except Exception:
+                    # A secondary integration must never change a successful Connect outcome.
+                    run_site_sync_results[key] = {"status": "Failed", "message": "SharePoint sync failed unexpectedly; Connect creation succeeded."}
+            return run_site_sync_results[key]
 
         def assign_run_new_site_teid(customer_name: str, site_name: str, teid_resolution: dict[str, object]) -> tuple[str, bool]:
             site_key = normalize_site_name(site_name)
@@ -383,6 +407,7 @@ def process_rows(
             verification: dict | None = None
             customer_context = resolve_customer_context(row.bod, row.customer_name)
             modify_function_result: dict | None = None
+            site_sync_result: dict[str, str] | None = None
 
             log("row_start", "Processing row", row_number=row.row_number, details={"seid": row.seid, "action": row.contact_status})
 
@@ -938,6 +963,14 @@ def process_rows(
                             mutation = client.create_user(payload)
                             payload_list.append(payload)
 
+                    if mutation.success:
+                        site_sync_result = sync_created_site(
+                            dest_customer_name, payload["address"], resolved_teid or "",
+                            candidate_sites, teid_resolution,
+                        )
+                        if site_sync_result:
+                            log("sharepoint_sync", site_sync_result["message"], row_number=row.row_number, details=site_sync_result)
+
                     if mutation.guid:
                         member_matches = client.search_user_by_seid(
                             row.seid,
@@ -979,6 +1012,8 @@ def process_rows(
                         create_step["final_pin"] = None
                         row_notes.append("Old site was already deactivated, but the new-site create did not complete. Manual intervention is required.")
                     row_notes.append(mutation.message)
+                    if site_sync_result:
+                        row_notes.append(site_sync_result["message"])
                     modify_function_result["reassigned_employee_id"] = retried_with_fallback
                     registry.write_pin_registry(
                         connection,
@@ -1013,6 +1048,7 @@ def process_rows(
                             response=mutation.raw_response,
                             verification=verification,
                             modify_function=modify_function_result,
+                            sharepoint_sync=site_sync_result,
                         )
                     )
                     continue
@@ -1262,6 +1298,14 @@ def process_rows(
                 payload_list.append(payload)
                 log("insert_response", "Requester insert completed", row_number=row.row_number, details=mutation.raw_response)
 
+                if mutation.success:
+                    site_sync_result = sync_created_site(
+                        customer_name, payload["address"], resolved_teid or "",
+                        candidate_sites, teid_resolution,
+                    )
+                    if site_sync_result:
+                        log("sharepoint_sync", site_sync_result["message"], row_number=row.row_number, details=site_sync_result)
+
                 if mutation.guid:
                     member_matches = client.search_user_by_seid(
                         row.seid,
@@ -1289,6 +1333,8 @@ def process_rows(
 
                 status = "Created" if mutation.success else "Failed"
                 row_notes.append(mutation.message)
+                if site_sync_result:
+                    row_notes.append(site_sync_result["message"])
                 registry.write_pin_registry(
                     connection,
                     seid=row.seid,
@@ -1321,6 +1367,7 @@ def process_rows(
                         connect_guid=mutation.guid,
                         response=mutation.raw_response,
                         verification=verification,
+                        sharepoint_sync=site_sync_result,
                     )
                 )
             except ConnectAPIError as exc:

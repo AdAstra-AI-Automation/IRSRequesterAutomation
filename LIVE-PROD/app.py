@@ -108,6 +108,9 @@ def _build_trimmed_summary(summary: dict[str, int]) -> dict[str, int]:
 
 
 def _build_result_message(row_result: dict[str, Any]) -> str:
+    sync = row_result.get("sharepoint_sync") or {}
+    if sync.get("status") == "Failed" and row_result.get("status") == "Created":
+        return f"Requester created in Connect. SharePoint sync needs attention: {sync.get('message', '')}"
     if row_result.get("status") == "Manual Intervention Required":
         modify = row_result.get("modify_function") or {}
         deactivate_step = modify.get("deactivate_step") or {}
@@ -118,10 +121,11 @@ def _build_result_message(row_result: dict[str, Any]) -> str:
                 return f"Old site was already deactivated, but the new-site create failed: {create_message}"
             return "Old site was already deactivated, but the new-site create failed. Manual intervention is required."
     response = row_result.get("response") or {}
-    if response.get("text"):
-        return str(response["text"])
     notes = row_result.get("notes") or []
-    return str(notes[-1]) if notes else ""
+    message = str(response["text"]) if response.get("text") else str(notes[-1]) if notes else ""
+    if sync.get("status") in {"Appended", "Skipped"} and sync.get("message") != message:
+        message = f"{message} {sync['message']}".strip()
+    return message
 
 
 def _last_log_details(logs: list[dict[str, Any]], stage: str) -> dict[str, Any]:
@@ -184,6 +188,7 @@ def _format_rows_response(request_rows: list[dict[str, Any]], run_result: dict[s
                     "teid": row_result.get("resolved_site_id") or "",
                     "pin": row_result.get("generated_pin") or "",
                     "posted_payload_address": (row_result.get("payload") or {}).get("address") or "",
+                    "sharepoint_sync": row_result.get("sharepoint_sync") or {},
                 },
             }
         )
