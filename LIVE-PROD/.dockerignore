@@ -10,3 +10,6 @@ venv/
 data/output/
 data/*.db-journal
 .git/
+.env
+.env.*
+data/

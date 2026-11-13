@@ -13,7 +13,7 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 COPY app.py frontend.py main.py ./
 COPY src ./src
 COPY utils ./utils
-COPY data ./data
+RUN mkdir -p /app/data/input /app/data/output
 
 EXPOSE 8000 8501
 
